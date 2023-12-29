@@ -66,15 +66,16 @@ mod timestamp {
     pub fn serialize<S: serde::Serializer>(t: &Time, s: S) -> Result<S::Ok, S::Error> {
         let epoch_time = t.duration_since(Time::UNIX_EPOCH).unwrap();
         let epoch_secs = epoch_time.as_secs();
-        let mut ret = String::with_capacity("1994-05-06T07:08:09Z_".len());
+        let mut ret = String::from("1994-05-06T07:08:09Z_");
         unsafe {
             let tm = gmtime(&(epoch_secs as i64));
-            strftime(
+            let len = strftime(
                 ret.as_mut_ptr() as *mut i8,
                 ret.capacity() as isize,
                 ISO_UTC_FMT,
                 tm,
             );
+            ret.truncate(len as usize);
         }
         s.serialize_str(&ret)
     }
