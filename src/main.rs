@@ -145,7 +145,42 @@ struct Podcast {
     logo_url: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+fn minus_opt<'de, D: serde::Deserializer<'de>>(dsr: D) -> Result<Option<u64>, D::Error> {
+    struct MinusOptVisitor;
+    impl<'de> serde::de::Visitor<'de> for MinusOptVisitor {
+        type Value = Option<u64>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "u64 or -1")
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Some(v))
+        }
+        fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if v == -1 {
+                Ok(None)
+            } else {
+                Err(E::invalid_value(serde::de::Unexpected::Signed(v), &self))
+            }
+        }
+    }
+    dsr.deserialize_any(MinusOptVisitor)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "lowercase")]
 enum Action {
     Add,
@@ -153,8 +188,11 @@ enum Action {
     Download,
     Delete,
     Play {
+        #[serde(deserialize_with = "minus_opt")]
         started: Option<u64>,
+        #[serde(deserialize_with = "minus_opt")]
         position: Option<u64>,
+        #[serde(deserialize_with = "minus_opt")]
         total: Option<u64>,
     },
     New,
@@ -686,7 +724,13 @@ async fn post_events(mut req: Request<()>) -> tide::Result {
     let (path_username, format) = split_suffix(path_username);
     assert_format(format)?;
     assert_auth(&req, Some(path_username))?;
-    let mut evts: Vec<Event> = req.body_json().await?;
+    let mut evts: Vec<Event> = match req.body_json().await {
+        Ok(evts) => evts,
+        Err(err) => {
+            log::debug!("unable to deserialize: {}", req.body_string().await?);
+            Err(err)?
+        }
+    };
     let surls = sanitize_urls(evts.iter_mut().map(|evt| &mut evt.podcast));
     userdata(|userdata| {
         userdata.events.extend(evts);
@@ -704,6 +748,26 @@ async fn post_events(mut req: Request<()>) -> tide::Result {
         .build())
 }
 
+struct DebugPrintMiddleware;
+
+#[tide::utils::async_trait]
+impl<State: Clone + Send + Sync + 'static> tide::Middleware<State> for DebugPrintMiddleware {
+    async fn handle(
+        &self,
+        mut request: Request<State>,
+        next: tide::Next<'_, State>,
+    ) -> tide::Result {
+        // if log::log_enabled!(log::Level::Debug) {
+        let req_body = request.body_string().await?;
+        let res = next.run(request).await;
+        log::info!("request body: {req_body}");
+        Ok(res)
+        // } else {
+        //     Ok(next.run(request).await)
+        // }
+    }
+}
+
 #[async_std::main]
 async fn main() {
     timestamp::init();
@@ -716,6 +780,7 @@ async fn main() {
             .expect("GPODRS_SESSION_SECRET must be set")
             .as_bytes(),
     ));
+    // app.with(DebugPrintMiddleware);
     // https://gpoddernet.readthedocs.io/en/latest/api/reference/clientconfig.html
     app.at("/clientconfig.json").get(todo);
     // https://gpoddernet.readthedocs.io/en/latest/api/reference/auth.html
@@ -751,4 +816,31 @@ async fn main() {
         .map(|s| s.as_str())
         .unwrap_or("localhost:3005");
     app.listen(listen_addr).await.expect("listen");
+}
+
+#[test]
+fn test_minus_opt() {
+    let act: Result<Action, _> =
+        serde_json::from_str(r#"{"action": "play", "started": -1, "position": -1, "total": -1}"#)
+            .map_err(|err| err.to_string());
+    assert_eq!(
+        Ok(Action::Play {
+            started: None,
+            position: None,
+            total: None
+        }),
+        act
+    );
+    let act: Result<Action, _> = serde_json::from_str(
+        r#"{"action": "play", "started": null, "position": null, "total": null}"#,
+    )
+    .map_err(|err| err.to_string());
+    assert_eq!(
+        Ok(Action::Play {
+            started: None,
+            position: None,
+            total: None
+        }),
+        act
+    );
 }
