@@ -1,0 +1,43 @@
+{
+  "username": "test_user",
+  "password": "10a6e6cc8311a3e2bcc09bf6c199adecd5dd59408c343e926b129c4914f3cb01",
+  "podcasts": [
+    {
+      "url": "https://feeds.transistor.fm/oxide-and-friends"
+    },
+    {
+      "url": "https://hackaday.libsyn.com/rss"
+    },
+    {
+      "url": "https://rss.art19.com/eye-of-the-duck"
+    },
+    {
+      "url": "https://feeds.acast.com/public/shows/fc4a3126-378d-4439-9b05-0a367ce68e08"
+    },
+    {
+      "url": "https://feeds.simplecast.com/XSy42e1F"
+    }
+  ],
+  "devices": [
+    {
+      "id": "jelly2",
+      "caption": "jelly2",
+      "type": "mobile",
+      "subscriptions": 0
+    }
+  ],
+  "devsubs": [
+    {
+      "deviceid": "jelly2",
+      "add": [
+        "https://feeds.transistor.fm/oxide-and-friends",
+        "https://hackaday.libsyn.com/rss",
+        "https://rss.art19.com/eye-of-the-duck",
+        "https://feeds.acast.com/public/shows/fc4a3126-378d-4439-9b05-0a367ce68e08",
+        "https://feeds.simplecast.com/XSy42e1F"
+      ],
+      "remove": [],
+      "timestamp": 1693477527
+    }
+  ]
+}

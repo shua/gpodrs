@@ -1,11 +1,13 @@
 use anyhow::anyhow;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use log;
 use serde::{Deserialize, Serialize};
-use serde_json;
-use std::time::{Duration, SystemTime as Time};
+use std::{
+    io::{BufReader, Seek, Write},
+    time::SystemTime,
+};
 use tide::{Request, Response};
+use time::OffsetDateTime as Time;
 
 // https://github.com/bohwaz/micro-gpodder-server
 // https://github.com/ahgamut/rust-ape-example
@@ -15,118 +17,54 @@ fn default<T: std::default::Default>() -> T {
 }
 
 fn now() -> u64 {
-    Time::now()
-        .duration_since(Time::UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_secs()
 }
 
 mod timestamp {
-    use std::ffi::{c_char, c_long};
-    use std::time::{Duration, SystemTime as Time};
-
-    const ISO_UTC_FMT: *const i8 = "%FT%T\0".as_ptr().cast();
-
-    #[repr(C)]
-    #[allow(non_camel_case_types)]
-    struct tm {
-        tm_sec: i32,
-        tm_min: i32,
-        tm_hour: i32,
-        tm_mday: i32,
-        tm_mon: i32,
-        tm_year: i32,
-        tm_wday: i32,
-        tm_yday: i32,
-        tm_isdst: i32,
-
-        tm_gmtoff: i64,
-        tm_zone: *const c_char,
-    }
-
-    extern "C" {
-        static timezone: c_long;
-        fn tzset();
-        fn strftime(buf: *mut c_char, max: isize, format: *const c_char, tm: *const tm) -> isize;
-        fn strptime(s: *const c_char, format: *const c_char, tm: *mut tm) -> *const c_char;
-        fn gmtime(timep: *const c_long) -> *mut tm;
-        fn mktime(tm: *mut tm) -> c_long;
-    }
-
-    pub fn init() {
-        std::env::set_var("TZ", "UTC");
-        unsafe { tzset() };
-        assert_eq!(
-            unsafe { timezone },
-            0,
-            "timezone should be set to 0 seconds from UTC"
-        );
-    }
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime as Time;
 
     pub fn serialize<S: serde::Serializer>(t: &Time, s: S) -> Result<S::Ok, S::Error> {
-        let epoch_time = t.duration_since(Time::UNIX_EPOCH).unwrap();
-        let epoch_secs = epoch_time.as_secs();
-        let mut ret = String::from("1994-05-06T07:08:09Z_");
-        unsafe {
-            let tm = gmtime(&(epoch_secs as i64));
-            let len = strftime(
-                ret.as_mut_ptr() as *mut i8,
-                ret.capacity() as isize,
-                ISO_UTC_FMT,
-                tm,
-            );
-            ret.truncate(len as usize);
-        }
-        s.serialize_str(&ret)
-    }
-
-    struct TimestampVisitor;
-
-    impl<'de> serde::de::Visitor<'de> for TimestampVisitor {
-        type Value = Time;
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("ISO timestamp")
-        }
-        fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
-            if s.is_empty() {
-                return Ok(Time::UNIX_EPOCH);
-            }
-
-            let c_s = format!("{s}\0");
-            let c_s_len = c_s.len();
-            let c_s: *const i8 = c_s.as_ptr().cast();
-            unsafe {
-                let mut tm: tm = std::mem::zeroed();
-                let ret = strptime(c_s, ISO_UTC_FMT, &mut tm);
-                if ret.is_null() || ret.offset_from(c_s) + 1 != c_s_len as isize {
-                    log::error!(
-                        "strptime({:?}, ISO_FMT, ...) = {:?} doesn't match expected {:?}+{:x}",
-                        c_s,
-                        ret,
-                        c_s,
-                        c_s_len
-                    );
-                    return Err(E::invalid_value(serde::de::Unexpected::Str(s), &self));
-                }
-                let epoch_secs = mktime(&mut tm);
-                if epoch_secs == -1 {
-                    log::error!("error calling mktime");
-                    return Err(E::invalid_value(serde::de::Unexpected::Str(s), &self));
-                }
-                Ok(Time::UNIX_EPOCH
-                    .checked_add(Duration::from_secs(epoch_secs as u64))
-                    .unwrap())
-            }
-        }
-        fn visit_u64<E: serde::de::Error>(self, n: u64) -> Result<Self::Value, E> {
-            Ok(Time::UNIX_EPOCH
-                .checked_add(Duration::from_secs(n))
-                .unwrap())
-        }
+        s.serialize_str(
+            t.replace_millisecond(0)
+                .unwrap()
+                .format(&Rfc3339)
+                .unwrap()
+                .as_str(),
+        )
     }
 
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(dsr: D) -> Result<Time, D::Error> {
-        dsr.deserialize_str(TimestampVisitor)
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Time;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("ISO timestamp")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
+                if s.is_empty() {
+                    return Ok(Time::UNIX_EPOCH);
+                }
+
+                match time::OffsetDateTime::parse(s, &Rfc3339) {
+                    Ok(t) => Ok(t),
+                    Err(_err) => Err(E::invalid_value(serde::de::Unexpected::Str(s), &self)),
+                }
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, n: u64) -> Result<Self::Value, E> {
+                Ok(Time::UNIX_EPOCH
+                    .checked_add(time::Duration::seconds(n as i64))
+                    .unwrap())
+            }
+        }
+
+        dsr.deserialize_str(Visitor)
     }
 }
 
@@ -145,6 +83,7 @@ struct Podcast {
     logo_url: String,
 }
 
+// minus_opt deserializes an optional positive value, with None serialized as '-1'
 fn minus_opt<'de, D: serde::Deserializer<'de>>(dsr: D) -> Result<Option<u64>, D::Error> {
     struct MinusOptVisitor;
     impl<'de> serde::de::Visitor<'de> for MinusOptVisitor {
@@ -199,7 +138,7 @@ enum Action {
     Flattr,
 }
 
-#[derive(Clone, PartialEq, Eq, Ord, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Event {
     podcast: String,
     #[serde(default)]
@@ -213,6 +152,12 @@ struct Event {
 
 impl std::cmp::PartialOrd for Event {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::cmp::Ord for Event {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         (
             self.timestamp,
             &self.podcast,
@@ -220,7 +165,7 @@ impl std::cmp::PartialOrd for Event {
             &self.action,
             &self.device,
         )
-            .partial_cmp(&(
+            .cmp(&(
                 other.timestamp,
                 &other.podcast,
                 &other.episode,
@@ -247,18 +192,80 @@ struct UserData {
     username: String,
     password: String,
     podcasts: Vec<Podcast>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     events: Vec<Event>,
     devices: Vec<Device>,
     devsubs: Vec<DevSubDiff>,
 }
 
-fn userdata<R>(f: impl FnOnce(&mut UserData) -> tide::Result<R>) -> tide::Result<R> {
+fn userdata<R>(
+    username: &str,
+    f: impl FnOnce(&mut UserData) -> tide::Result<R>,
+) -> tide::Result<R> {
+    use std::io::BufRead;
+    let cfg = std::env::var("GPODRS_CONFIG_DIR").unwrap_or("./".to_string());
+    let mut cfg = std::path::PathBuf::from(cfg);
+    cfg.push(format!("{username}_cfg.json"));
+
+    if !std::fs::exists(&cfg)? {
+        log::info!("unable to find v2 userdata, fallback to v1");
+        return userdata_v1(username, f);
+    }
+
+    let mut user_cfg = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(false)
+        .open(&cfg)?;
+    cfg.pop();
+    cfg.push(format!("{username}_events.json"));
+    let mut user_events = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(false)
+        .open(&cfg)?;
+
+    let mut userdata: UserData = serde_json::from_reader(&user_cfg)?;
+    assert!(
+        userdata.events.is_empty(),
+        "userdata v2 does not include events in <user>_cfg.json"
+    );
+    for line in BufReader::new(&mut user_events).lines() {
+        let event: Event = serde_json::from_str(&line?)?;
+        userdata.events.push(event);
+    }
+
+    let mut data2 = userdata.clone();
+    let ret = f(&mut data2)?;
+    if userdata != data2 {
+        let events = std::mem::take(&mut data2.events);
+        user_cfg.seek(std::io::SeekFrom::Start(0))?;
+        serde_json::to_writer_pretty(&user_cfg, &data2)?;
+        let flen = user_cfg.stream_position()?;
+        user_cfg.set_len(flen)?;
+        user_events.seek(std::io::SeekFrom::Start(0))?;
+        for event in events {
+            serde_json::to_writer(&user_events, &event)?;
+            writeln!(user_events)?;
+        }
+        let flen = user_events.stream_position()?;
+        user_events.set_len(flen)?;
+    }
+
+    Ok(ret)
+}
+
+fn userdata_v1<R>(
+    username: &str,
+    f: impl FnOnce(&mut UserData) -> tide::Result<R>,
+) -> tide::Result<R> {
     use std::io::{Seek, SeekFrom};
     let mut cfg = std::env::var("GPODRS_CONFIG_DIR").unwrap_or("./".to_string());
     if !cfg.ends_with('/') {
         cfg.push('/');
     }
-    cfg.push_str("shua.json");
+    cfg.push_str(username);
+    cfg.push_str(".json");
     log::info!("user config: {cfg}");
     let mut datafile = std::fs::File::options()
         .read(true)
@@ -283,6 +290,15 @@ async fn todo(mut req: Request<()>) -> tide::Result {
     Ok(Response::builder(501).body("not implemented yet").build())
 }
 
+macro_rules! bail {
+    ($status:literal, $($err:tt)*) => {
+        return Err(tide::Error::new(
+            $status,
+            anyhow!($($err)*),
+        ))
+    }
+}
+
 // auth
 
 async fn auth_login(mut req: Request<()>) -> tide::Result {
@@ -291,45 +307,27 @@ async fn auth_login(mut req: Request<()>) -> tide::Result {
     if let Some(sess_username) = req.session().get::<String>("username") {
         // check sessionid
         if sess_username != path_username {
-            return Err(tide::Error::new(
-                400,
-                anyhow!("session username is not valid for authenticated user"),
-            ));
+            bail!(400, "session username is not valid for authenticated user");
         }
         return Ok("".into());
     }
 
     // normal auth flow
-    let auth_hdr = req
-        .header("Authorization")
-        .map(|hdrs| hdrs.last())
-        .ok_or(tide::Error::new(
-            401,
-            anyhow!("authorization header not present"),
-        ))?;
+    let Some(auth_hdr) = req.header("Authorization").map(|hdrs| hdrs.last()) else {
+        bail!(401, "authorization header not present",);
+    };
     if !auth_hdr.as_str().starts_with("Basic ") {
-        return Err(tide::Error::new(
-            401,
-            anyhow!("authorize header is not Basic"),
-        ));
+        bail!(401, "authorize header is not Basic");
     }
     let auth_hdr = BASE64
         .decode(&auth_hdr.as_str()["Basic ".len()..])
         .map_err(|e| tide::Error::new(401, e))?;
     let auth_hdr = String::from_utf8(auth_hdr).map_err(|e| tide::Error::new(401, e))?;
-    let (auth_username, auth_password) = (auth_hdr
-        .find(":")
-        .map(|i| auth_hdr.split_at(i))
-        .map(|(u, p)| (u, &p[1..])))
-    .ok_or(tide::Error::new(
-        401,
-        anyhow!("authorize header is not valid basic auth"),
-    ))?;
+    let Some((auth_username, auth_password)) = auth_hdr.split_once(':') else {
+        bail!(401, "authorize header is not valid basic auth");
+    };
     if auth_username != path_username {
-        return Err(tide::Error::new(
-            401,
-            anyhow!("login username does not match path resource"),
-        ));
+        bail!(401, "login username does not match path resource");
     }
 
     let auth_password_hash = {
@@ -344,8 +342,8 @@ async fn auth_login(mut req: Request<()>) -> tide::Result {
         ret
     };
     log::info!("password hash: {auth_password_hash}");
-    match userdata(|userdata| {
-        Ok(path_username == ""
+    match userdata(auth_username, |userdata| {
+        Ok(path_username.is_empty()
             || userdata.username != auth_username
             || userdata.password != auth_password_hash)
     }) {
@@ -353,20 +351,17 @@ async fn auth_login(mut req: Request<()>) -> tide::Result {
             if let Some(ioerr) = err.downcast_ref::<std::io::Error>() {
                 if ioerr.kind() == std::io::ErrorKind::NotFound {
                     log::error!("{ioerr}");
-                    return Err(tide::Error::new(
-                        401,
-                        anyhow!("user {auth_username} does not exist"),
-                    ));
+                    bail!(401, "user {auth_username} does not exist");
                 }
             }
             return Err(err);
         }
         Ok(false) => {}
         Ok(true) => {
-            return Err(tide::Error::new(
+            bail!(
                 401,
-                anyhow!("unable to authenticate: {auth_username:?} {auth_password:?}"),
-            ));
+                "unable to authenticate: {auth_username:?} {auth_password:?}"
+            );
         }
     }
 
@@ -378,10 +373,7 @@ async fn auth_logout(mut req: Request<()>) -> tide::Result {
     let path_username = req.param("username")?;
     if let Some(sess_username) = req.session().get::<String>("username") {
         if path_username != sess_username {
-            return Err(tide::Error::new(
-                400,
-                anyhow!("session user does not match path resource"),
-            ));
+            bail!(400, "session user does not match path resource");
         }
     }
 
@@ -398,7 +390,7 @@ fn split_suffix(s: &str) -> (&str, &str) {
 
 fn assert_format(f: &str) -> tide::Result<()> {
     if f != "json" {
-        Err(tide::Error::new(400, anyhow!("no format specified")))
+        bail!(400, "no format specified")
     } else {
         Ok(())
     }
@@ -411,7 +403,9 @@ async fn list_devices(req: Request<()>) -> tide::Result {
     let (path_username, format) = split_suffix(path_username);
     assert_format(format)?;
     assert_auth(&req, Some(path_username))?;
-    let body_json = userdata(|userdata| Ok(serde_json::to_string(&userdata.devices)?))?;
+    let body_json = userdata(path_username, |userdata| {
+        Ok(serde_json::to_string(&userdata.devices)?)
+    })?;
     Ok(Response::builder(200)
         .body(body_json)
         .content_type("application/json")
@@ -422,19 +416,20 @@ async fn update_device(mut req: Request<()>) -> tide::Result {
     let path_username = req.param("username")?;
     assert_auth(&req, Some(path_username))?;
     let path_deviceid = req.param("deviceid")?;
-    let (path_deviceid, format) = split_suffix(&path_deviceid);
+    let (path_deviceid, format) = split_suffix(path_deviceid);
     let path_deviceid = path_deviceid.to_string();
     assert_format(format)?;
 
     let mut device: Device = req.body_json().await?;
+    let path_username = req.param("username")?;
     device.id = path_deviceid;
-    if device.id != "" {
-        userdata(|userdata| {
+    if !device.id.is_empty() {
+        userdata(path_username, |userdata| {
             if let Some(dev) = userdata.devices.iter_mut().find(|d| d.id == device.id) {
-                if device.caption != "" {
+                if !device.caption.is_empty() {
                     dev.caption = device.caption;
                 }
-                if device.r#type != "" {
+                if !device.r#type.is_empty() {
                     dev.r#type = device.r#type;
                 }
                 if device.subscriptions != 0 {
@@ -467,7 +462,9 @@ async fn get_subscriptions(req: Request<()>) -> tide::Result {
     assert_format(format)?;
     assert_auth(&req, Some(path_username))?;
 
-    let subs = userdata(|userdata| Ok(serde_json::to_string(&userdata.podcasts)?))?;
+    let subs = userdata(path_username, |userdata| {
+        Ok(serde_json::to_string(&userdata.podcasts)?)
+    })?;
     Ok(Response::builder(200)
         .content_type("application/json")
         .body(subs)
@@ -478,19 +475,15 @@ fn assert_auth<T>(req: &Request<T>, path_username: Option<&str>) -> tide::Result
     match (req.session().get::<String>("username"), path_username) {
         (Some(sess_username), Some(path_username)) => {
             if sess_username != path_username {
-                Err(tide::Error::new(
+                bail!(
                     401,
-                    anyhow!("authenticated user does not have access to requested user's data"),
-                ))
-            } else {
-                Ok(())
+                    "authenticated user does not have access to requested user's data",
+                )
             }
+            Ok(())
         }
         (Some(_sess_username), None) => Ok(()),
-        (None, _) => Err(tide::Error::new(
-            401,
-            anyhow!("request is not authenticated"),
-        )),
+        (None, _) => bail!(401, "request is not authenticated"),
     }
 }
 
@@ -516,7 +509,8 @@ async fn put_subscriptions(mut req: Request<()>) -> tide::Result {
     let path_deviceid = path_deviceid.to_string();
     let mut subs: Vec<Podcast> = req.body_json().await?;
     sanitize_urls(subs.iter_mut().map(|s| &mut s.url));
-    userdata(|userdata| {
+    let path_username = req.param("username")?;
+    userdata(path_username, |userdata| {
         userdata.devsubs.push(DevSubDiff {
             deviceid: path_deviceid,
             diff: SubDiff {
@@ -550,24 +544,24 @@ struct DevSubDiff {
 
 impl PartialOrd for DevSubDiff {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DevSubDiff {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         (
             self.diff.timestamp,
             &self.deviceid,
             &self.diff.add,
             &self.diff.remove,
         )
-            .partial_cmp(&(
+            .cmp(&(
                 other.diff.timestamp,
                 &other.deviceid,
                 &other.diff.add,
                 &other.diff.remove,
             ))
-    }
-}
-
-impl Ord for DevSubDiff {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
     }
 }
 
@@ -585,13 +579,14 @@ async fn update_subscriptions(mut req: Request<()>) -> tide::Result {
     assert_format(format)?;
     let path_deviceid = path_deviceid.to_string();
     let mut diff: SubDiff = req.body_json().await?;
-    println!("body: {diff:?}");
+    log::debug!("body: {diff:?}");
     let surls = sanitize_urls(diff.add.iter_mut().chain(diff.remove.iter_mut()));
-    if diff.add.len() == 0 && diff.remove.len() == 0 {
+    if diff.add.is_empty() && diff.remove.is_empty() {
         return Ok("".into());
     }
-    if diff.add.iter().any(|u| diff.remove.contains(u)) {}
-    userdata(|userdata| {
+    // if diff.add.iter().any(|u| diff.remove.contains(u)) {}
+    let path_username = req.param("username")?;
+    userdata(path_username, |userdata| {
         let mut curdiff = DevSubDiff {
             deviceid: path_deviceid,
             diff: diff.clone(),
@@ -603,9 +598,11 @@ async fn update_subscriptions(mut req: Request<()>) -> tide::Result {
             ..default()
         }));
         for url in diff.remove {
-            if let Some((i, _)) = (userdata.podcasts.iter().enumerate())
-                .filter(|(_, p)| p.url == url)
-                .next()
+            if let Some((i, _)) = userdata
+                .podcasts
+                .iter()
+                .enumerate()
+                .find(|(_, p)| p.url == url)
             {
                 userdata.podcasts.swap_remove(i);
             }
@@ -632,15 +629,12 @@ async fn get_sub_changes(req: Request<()>) -> tide::Result {
 
     let mut since = 0;
     for (k, v) in req.url().query_pairs() {
-        match k.as_ref() {
-            "since" => {
-                let epoch_secs = u64::from_str_radix(&v, 10)?;
-                since = epoch_secs;
-            }
-            _ => {}
+        if k.as_ref() == "since" {
+            let epoch_secs = v.parse::<u64>()?;
+            since = epoch_secs;
         }
     }
-    let body_json = userdata(|userdata| {
+    let body_json = userdata(path_username, |userdata| {
         let subdiff = userdata
             .devsubs
             .iter()
@@ -684,29 +678,25 @@ async fn get_events(req: Request<()>) -> tide::Result {
     let mut _aggregated = true;
     for (k, v) in req.url().query_pairs() {
         match k.as_ref() {
-            "since" => since = u64::from_str_radix(&v, 10)?,
+            "since" => since = v.parse::<u64>()?,
             "podcast" => podcast = v.to_string(),
             "aggregated" => _aggregated = v.as_ref() == "true",
             _ => {}
         }
     }
     let since = Time::UNIX_EPOCH
-        .checked_add(Duration::from_secs(since))
+        .checked_add(time::Duration::seconds(since as i64))
         .unwrap();
 
-    let body_json = userdata(|userdata| {
+    let body_json = userdata(path_username, |userdata| {
         let evts = userdata
             .events
             .iter()
-            .filter(|evt| podcast == "" || evt.podcast == podcast)
+            .filter(|evt| podcast.is_empty() || evt.podcast == podcast)
             .filter(|evt| evt.timestamp >= since);
         let epacts = evts.fold(EpisodeActions::default(), |mut acc, evt| {
-            acc.actions.push(evt.action.clone());
-            acc.timestamp = evt
-                .timestamp
-                .duration_since(Time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
+            acc.actions.push(evt.action);
+            acc.timestamp = (evt.timestamp - Time::UNIX_EPOCH).whole_seconds() as u64;
             acc
         });
 
@@ -732,7 +722,8 @@ async fn post_events(mut req: Request<()>) -> tide::Result {
         }
     };
     let surls = sanitize_urls(evts.iter_mut().map(|evt| &mut evt.podcast));
-    userdata(|userdata| {
+    let path_username = req.param("username")?;
+    userdata(path_username, |userdata| {
         userdata.events.extend(evts);
         userdata.events.sort();
         Ok(())
@@ -748,6 +739,7 @@ async fn post_events(mut req: Request<()>) -> tide::Result {
         .build())
 }
 
+#[allow(unused)]
 struct DebugPrintMiddleware;
 
 #[tide::utils::async_trait]
@@ -770,8 +762,21 @@ impl<State: Clone + Send + Sync + 'static> tide::Middleware<State> for DebugPrin
 
 #[async_std::main]
 async fn main() {
-    timestamp::init();
     femme::start();
+
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("serve") | None => cmd_serve().await,
+        Some("migrate_user") => cmd_migrate_user(&args.next().unwrap()).await,
+        Some("-h") | Some("--help") => cmd_help().await,
+        Some(arg0) => {
+            eprintln!("unrecognized cmd {arg0:?}");
+            cmd_help().await
+        }
+    }
+}
+
+async fn cmd_serve() {
     let mut app = tide::new();
     app.with(tide::log::LogMiddleware::new());
     app.with(tide::sessions::SessionMiddleware::new(
@@ -816,6 +821,70 @@ async fn main() {
         .map(|s| s.as_str())
         .unwrap_or("localhost:3005");
     app.listen(listen_addr).await.expect("listen");
+}
+
+async fn cmd_migrate_user(username: &str) {
+    let mut cfg_v1 = std::env::var("GPODRS_CONFIG_DIR").unwrap_or("./".to_string());
+    if !cfg_v1.ends_with('/') {
+        cfg_v1.push('/');
+    }
+    cfg_v1.push_str(username);
+    cfg_v1.push_str(".json");
+    if !std::fs::exists(&cfg_v1).unwrap_or(false) {
+        eprintln!("userdata v1 file {cfg_v1:?} not found");
+        std::process::exit(1);
+    }
+
+    let datafile = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(false)
+        .open(&cfg_v1)
+        .expect("open userdata v1 file");
+    let mut userdata: UserData = serde_json::from_reader(&datafile).expect("read userdata");
+
+    let cfg_v2 = std::env::var("GPODRS_CONFIG_DIR").unwrap_or("./".to_string());
+    let mut cfg_v2 = std::path::PathBuf::from(cfg_v2);
+    cfg_v2.push(format!("{username}_cfg.json"));
+
+    if std::fs::exists(&cfg_v2).unwrap_or(false) {
+        eprintln!("userdata v2 file {:?} exists", cfg_v2.display());
+        std::process::exit(1);
+    }
+
+    let user_cfg = std::fs::File::options()
+        .read(false)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&cfg_v2)
+        .expect("create userdata v2 file");
+    cfg_v2.pop();
+    cfg_v2.push(format!("{username}_events.json"));
+    let user_events = std::fs::File::options()
+        .read(false)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&cfg_v2)
+        .expect("create userdata v2 events file");
+
+    let events = std::mem::take(&mut userdata.events);
+
+    serde_json::to_writer_pretty(user_cfg, &userdata).expect("write userdata cfg");
+    for event in events {
+        serde_json::to_writer(&user_events, &event).expect("write userdata event");
+        writeln!(&user_events).unwrap();
+    }
+
+    println!("migrated {username} config to v2");
+}
+
+async fn cmd_help() {
+    eprintln!("usage: gpodrs [-h] [CMD]");
+    eprintln!("CMD:");
+    eprintln!("    serve         # default");
+    eprintln!("    migrate_user");
 }
 
 #[test]
