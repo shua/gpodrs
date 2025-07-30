@@ -23,18 +23,29 @@ fn now() -> u64 {
         .as_secs()
 }
 
+/// confusingly, the event timestamps are formatted as ISO8601 date-times without an offset
+/// and the offset is assumed to be UTC.
+///
+/// So we need some special casing to parse this correctly to a UtcDateTime, and serialize it correctly as well
 mod timestamp {
-    use time::format_description::well_known::Rfc3339;
-    use time::OffsetDateTime as Time;
+    use time::{
+        format_description::well_known::{iso8601, Iso8601},
+        OffsetDateTime as Time, UtcOffset,
+    };
 
     pub fn serialize<S: serde::Serializer>(t: &Time, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(
-            t.replace_millisecond(0)
-                .unwrap()
-                .format(&Rfc3339)
-                .unwrap()
-                .as_str(),
-        )
+        // just make sure it's UTC
+        let t = t.to_offset(UtcOffset::UTC);
+        let local = time::PrimitiveDateTime::new(t.date(), t.time());
+
+        // don't print so many 0s after the second
+        const ISO8601_FORMAT: iso8601::EncodedConfig = iso8601::Config::DEFAULT
+            .set_time_precision(iso8601::TimePrecision::Second {
+                decimal_digits: None,
+            })
+            .set_formatted_components(iso8601::FormattedComponents::DateTime)
+            .encode();
+        s.serialize_str(local.format(&Iso8601::<ISO8601_FORMAT>).unwrap().as_str())
     }
 
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(dsr: D) -> Result<Time, D::Error> {
@@ -43,7 +54,7 @@ mod timestamp {
         impl<'de> serde::de::Visitor<'de> for Visitor {
             type Value = Time;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("ISO timestamp")
+                f.write_str("'yyyy-MM-ddTHH:mm:ss' (ISO 8601 local) timestamp")
             }
 
             fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
@@ -51,8 +62,8 @@ mod timestamp {
                     return Ok(Time::UNIX_EPOCH);
                 }
 
-                match time::OffsetDateTime::parse(s, &Rfc3339) {
-                    Ok(t) => Ok(t),
+                match time::PrimitiveDateTime::parse(s, &Iso8601::DATE_TIME) {
+                    Ok(t) => Ok(t.assume_utc()),
                     Err(_err) => Err(E::invalid_value(serde::de::Unexpected::Str(s), &self)),
                 }
             }
@@ -767,7 +778,7 @@ async fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("serve") | None => cmd_serve().await,
-        Some("migrate_user") => cmd_migrate_user(&args.next().unwrap()).await,
+        Some("migrate-user") => cmd_migrate_user(&args.next().unwrap()).await,
         Some("-h") | Some("--help") => cmd_help().await,
         Some(arg0) => {
             eprintln!("unrecognized cmd {arg0:?}");
@@ -884,7 +895,7 @@ async fn cmd_help() {
     eprintln!("usage: gpodrs [-h] [CMD]");
     eprintln!("CMD:");
     eprintln!("    serve         # default");
-    eprintln!("    migrate_user");
+    eprintln!("    migrate-user");
 }
 
 #[test]
@@ -911,5 +922,25 @@ fn test_minus_opt() {
             total: None
         }),
         act
+    );
+}
+
+#[test]
+fn test_event_timestamp() {
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Example {
+        #[serde(with = "timestamp")]
+        time: Time,
+    }
+
+    let time = Time::from_unix_timestamp(1753911230).unwrap();
+    assert_eq!(
+        serde_json::to_string(&Example { time }).unwrap(),
+        r#"{"time":"2025-07-30T21:33:50"}"#
+    );
+
+    assert_eq!(
+        Example { time },
+        serde_json::from_str(r#"{"time":"2025-07-30T21:33:50"}"#).unwrap(),
     );
 }
