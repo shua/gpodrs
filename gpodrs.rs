@@ -248,19 +248,48 @@ fn userdata<R>(
 
     let mut data2 = userdata.clone();
     let ret = f(&mut data2)?;
+    let events_pre = std::mem::take(&mut userdata.events);
+    let events = std::mem::take(&mut data2.events);
     if userdata != data2 {
-        let events = std::mem::take(&mut data2.events);
         user_cfg.seek(std::io::SeekFrom::Start(0))?;
         serde_json::to_writer_pretty(&user_cfg, &data2)?;
         let flen = user_cfg.stream_position()?;
         user_cfg.set_len(flen)?;
+    }
+
+    if events_pre != events {
         user_events.seek(std::io::SeekFrom::Start(0))?;
-        for event in events {
+        let prefix_lines = events
+            .iter()
+            .zip(&events_pre)
+            .take_while(|(a, b)| a == b)
+            .count();
+        log::debug!(
+            "events share {prefix_lines} common prefix lines (out of {} total)",
+            events.len()
+        );
+
+        let mut user_events = {
+            let mut rdr = BufReader::new(user_events);
+            // skip n lines
+            for _ in 0..prefix_lines {
+                rdr.skip_until(b'\n')?;
+            }
+
+            #[allow(
+                clippy::seek_from_current,
+                reason = "want to advance internal file as well"
+            )]
+            let flen = rdr.seek(std::io::SeekFrom::Current(0))?;
+            let rdr = rdr.into_inner();
+            rdr.set_len(flen)?;
+            rdr
+        };
+
+        for event in events.into_iter().skip(prefix_lines) {
             serde_json::to_writer(&user_events, &event)?;
             writeln!(user_events)?;
         }
-        let flen = user_events.stream_position()?;
-        user_events.set_len(flen)?;
     }
 
     Ok(ret)
@@ -734,6 +763,7 @@ async fn post_events(mut req: Request<()>) -> tide::Result {
     };
     let surls = sanitize_urls(evts.iter_mut().map(|evt| &mut evt.podcast));
     let path_username = req.param("username")?;
+    let (path_username, _) = split_suffix(path_username);
     userdata(path_username, |userdata| {
         userdata.events.extend(evts);
         userdata.events.sort();
@@ -898,49 +928,168 @@ async fn cmd_help() {
     eprintln!("    migrate-user");
 }
 
-#[test]
-fn test_minus_opt() {
-    let act: Result<Action, _> =
-        serde_json::from_str(r#"{"action": "play", "started": -1, "position": -1, "total": -1}"#)
-            .map_err(|err| err.to_string());
-    assert_eq!(
-        Ok(Action::Play {
-            started: None,
-            position: None,
-            total: None
-        }),
-        act
-    );
-    let act: Result<Action, _> = serde_json::from_str(
-        r#"{"action": "play", "started": null, "position": null, "total": null}"#,
-    )
-    .map_err(|err| err.to_string());
-    assert_eq!(
-        Ok(Action::Play {
-            started: None,
-            position: None,
-            total: None
-        }),
-        act
-    );
-}
+#[cfg(test)]
+mod test {
+    use std::path::Path;
 
-#[test]
-fn test_event_timestamp() {
-    #[derive(Debug, PartialEq, Serialize, Deserialize)]
-    struct Example {
-        #[serde(with = "timestamp")]
-        time: Time,
+    use super::*;
+
+    #[test]
+    fn test_minus_opt() {
+        let act: Result<Action, _> = serde_json::from_str(
+            r#"{"action": "play", "started": -1, "position": -1, "total": -1}"#,
+        )
+        .map_err(|err| err.to_string());
+        assert_eq!(
+            Ok(Action::Play {
+                started: None,
+                position: None,
+                total: None
+            }),
+            act
+        );
+        let act: Result<Action, _> = serde_json::from_str(
+            r#"{"action": "play", "started": null, "position": null, "total": null}"#,
+        )
+        .map_err(|err| err.to_string());
+        assert_eq!(
+            Ok(Action::Play {
+                started: None,
+                position: None,
+                total: None
+            }),
+            act
+        );
     }
 
-    let time = Time::from_unix_timestamp(1753911230).unwrap();
-    assert_eq!(
-        serde_json::to_string(&Example { time }).unwrap(),
-        r#"{"time":"2025-07-30T21:33:50"}"#
-    );
+    #[test]
+    fn test_event_timestamp() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Example {
+            #[serde(with = "timestamp")]
+            time: Time,
+        }
 
-    assert_eq!(
-        Example { time },
-        serde_json::from_str(r#"{"time":"2025-07-30T21:33:50"}"#).unwrap(),
-    );
+        let time = Time::from_unix_timestamp(1753911230).unwrap();
+        assert_eq!(
+            serde_json::to_string(&Example { time }).unwrap(),
+            r#"{"time":"2025-07-30T21:33:50"}"#
+        );
+
+        assert_eq!(
+            Example { time },
+            serde_json::from_str(r#"{"time":"2025-07-30T21:33:50"}"#).unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_update_events() {
+        femme::with_level(log::LevelFilter::Debug);
+
+        #[track_caller]
+        fn assert_file(path: impl AsRef<Path>, contents: &str) {
+            let actual = std::fs::read_to_string(path.as_ref()).expect("file exists");
+            assert!(
+                actual == contents,
+                "file contents don't match expected\n\nACTUAL: {path}\n{actual}\n\nEXPECTED:\n{contents}",
+                path = path.as_ref().display(),
+            );
+        }
+
+        struct Defer<F: FnOnce()>(Option<F>);
+        impl<F: FnOnce()> std::ops::Drop for Defer<F> {
+            fn drop(&mut self) {
+                if let Some(f) = self.0.take() {
+                    f()
+                }
+            }
+        }
+
+        let _cleanup = Defer(Some(|| {
+            let _ = std::fs::remove_file("test_user2_cfg.json");
+            let _ = std::fs::remove_file("test_user2_events.json");
+        }));
+        let test_user_cfg = std::fs::File::create("test_user2_cfg.json").unwrap();
+        let data = UserData {
+            username: "test_user2".to_string(),
+            password: "".to_string(),
+            podcasts: vec![],
+            events: vec![],
+            devices: vec![],
+            devsubs: vec![],
+        };
+        serde_json::to_writer_pretty(&test_user_cfg, &data).unwrap();
+
+        let events_path = "test_user2_events.json";
+        std::fs::File::create(events_path).unwrap();
+
+        let mut cur_time = Time::UNIX_EPOCH;
+        let mut event = Event {
+            podcast: "nothing".to_string(),
+            episode: "episode".to_string(),
+            device: "device".to_string(),
+            action: Action::Play {
+                started: Some(cur_time.unix_timestamp().try_into().unwrap()),
+                position: Some(0),
+                total: Some(0),
+            },
+            timestamp: cur_time,
+        };
+
+        assert_file(events_path, "");
+
+        userdata("test_user2", |data2| {
+            data2.events.push(event.clone());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_file(
+            events_path,
+            r#"{"podcast":"nothing","episode":"episode","device":"device","action":"play","started":0,"position":0,"total":0,"timestamp":"1970-01-01T00:00:00"}
+"#,
+        );
+
+        cur_time += std::time::Duration::from_secs(2);
+        event.action = Action::Play {
+            started: None,
+            position: Some(2),
+            total: Some(0),
+        };
+        event.timestamp = cur_time;
+
+        userdata("test_user2", |data2| {
+            data2.events.push(event.clone());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_file(
+            events_path,
+            r#"{"podcast":"nothing","episode":"episode","device":"device","action":"play","started":0,"position":0,"total":0,"timestamp":"1970-01-01T00:00:00"}
+{"podcast":"nothing","episode":"episode","device":"device","action":"play","started":null,"position":2,"total":0,"timestamp":"1970-01-01T00:00:02"}
+"#,
+        );
+
+        event.action = Action::Play {
+            started: None,
+            position: Some(1),
+            total: Some(0),
+        };
+        event.timestamp = cur_time - std::time::Duration::from_secs(1);
+
+        userdata("test_user2", |data2| {
+            data2.events.push(event.clone());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_file(
+            events_path,
+            r#"{"podcast":"nothing","episode":"episode","device":"device","action":"play","started":0,"position":0,"total":0,"timestamp":"1970-01-01T00:00:00"}
+{"podcast":"nothing","episode":"episode","device":"device","action":"play","started":null,"position":2,"total":0,"timestamp":"1970-01-01T00:00:02"}
+{"podcast":"nothing","episode":"episode","device":"device","action":"play","started":null,"position":1,"total":0,"timestamp":"1970-01-01T00:00:01"}
+"#,
+        );
+    }
 }
